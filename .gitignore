@@ -1,0 +1,77 @@
+# ======================
+# Python & IDE
+# ======================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Jupyter
+.ipynb_checkpoints
+
+# ======================
+# HF Transformers Dev
+# ======================
+# Skip installing test dependencies (if you use editable install)
+transformers_dev.egg-info/
+
+# ======================
+# Models & Data (CRITICAL!)
+# ======================
+# Hugging Face model weights (DO NOT COMMIT!)
+Llama-2-7b-hf/
+Qwen-7B/
+models/
+checkpoints/
+
+# Model cache from transformers
+~/.cache/huggingface/
+# But better to ignore via absolute path in global gitignore
+
+# ======================
+# Logs & Outputs
+# ======================
+logs/
+*.log
+results.csv
+results.md  # ← 如果 results.md 是自动生成的就忽略；如果是你手写的分析，不要忽略！
+output/
+runs/
+
+# ======================
+# System
+# ======================
+.DS_Store
+Thumbs.db
