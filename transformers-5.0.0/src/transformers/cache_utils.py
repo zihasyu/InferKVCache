@@ -1293,3 +1293,233 @@ class EncoderDecoderCache(Cache):
     @property
     def is_compileable(self) -> bool:
         return self.self_attention_cache.is_compileable
+
+
+# ====== 以下是你需要添加的代码（放在文件末尾） ======
+
+class PagedLayer(CacheLayerMixin):
+    """
+    Demo级 Paged KV：用“slot池”模拟分页，返回连续 [B,H,T,D]。
+    约束：仅支持 batch_size=1。
+    """
+    is_compileable = False
+    is_sliding = False
+
+    def __init__(self, block_size: int = 16, num_blocks: int = 1000, device: str = "cuda"):
+        super().__init__()
+        self.block_size = block_size
+        self.num_blocks = num_blocks
+        self._device_str = device
+
+        self.key_blocks = None
+        self.value_blocks = None
+        self.free_slots = []          # [(block_id, offset), ...]
+        self.token_to_slot = {}       # {logical_pos: (block_id, offset)}
+        self.cumulative_length = 0
+
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        self.dtype, self.device = key_states.dtype, key_states.device
+        _, self.num_heads, _, self.head_dim = key_states.shape
+
+        self.key_blocks = torch.zeros(
+            self.num_blocks, self.block_size, self.num_heads, self.head_dim, dtype=self.dtype, device=self.device
+        )
+        self.value_blocks = torch.zeros_like(self.key_blocks)
+
+        self.free_slots = [(b, o) for b in range(self.num_blocks) for o in range(self.block_size)]
+        self.keys = torch.empty((1, self.num_heads, 0, self.head_dim), dtype=self.dtype, device=self.device)
+        self.values = torch.empty_like(self.keys)
+        self.is_initialized = True
+
+    def _materialize(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(self.token_to_slot) == 0:
+            return self.keys, self.values
+
+        all_k, all_v = [], []
+        for pos in sorted(self.token_to_slot.keys()):
+            b, o = self.token_to_slot[pos]
+            all_k.append(self.key_blocks[b, o])   # [H,D]
+            all_v.append(self.value_blocks[b, o]) # [H,D]
+
+        # [T,H,D] -> [1,H,T,D]
+        k = torch.stack(all_k, dim=0).permute(1, 0, 2).unsqueeze(0).contiguous()
+        v = torch.stack(all_v, dim=0).permute(1, 0, 2).unsqueeze(0).contiguous()
+        return k, v
+
+    def _free_old_slot_if_exists(self, pos: int) -> None:
+        old = self.token_to_slot.get(pos, None)
+        if old is not None:
+            self.free_slots.append(old)
+
+    def update(
+        self, key_states: torch.Tensor, value_states: torch.Tensor, cache_kwargs: dict[str, Any] | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+
+        if key_states.shape[0] != 1:
+            raise NotImplementedError("Demo PagedLayer 仅支持 batch_size=1")
+
+        t = key_states.shape[-2]
+        if cache_kwargs is not None and cache_kwargs.get("cache_position") is not None:
+            cache_position = cache_kwargs["cache_position"].detach().cpu().tolist()
+        else:
+            cache_position = list(range(self.cumulative_length, self.cumulative_length + t))
+
+        if len(cache_position) != t:
+            raise ValueError(f"cache_position长度({len(cache_position)})必须等于当前token数({t})")
+
+        for i, pos in enumerate(cache_position):
+            pos = int(pos)
+            self._free_old_slot_if_exists(pos)  # 防止重写同一位置时slot泄漏
+
+            if len(self.free_slots) == 0:
+                raise RuntimeError("PagedLayer: 无可用 slot，请增大 num_blocks/block_size。")
+
+            b, o = self.free_slots.pop()
+            self.key_blocks[b, o].copy_(key_states[0, :, i, :])
+            self.value_blocks[b, o].copy_(value_states[0, :, i, :])
+            self.token_to_slot[pos] = (b, o)
+
+        self.cumulative_length = max(self.cumulative_length, max(int(p) for p in cache_position) + 1)
+        self.keys, self.values = self._materialize()
+        return self.keys, self.values
+
+    def reset(self) -> None:
+        if not self.is_initialized:
+            return
+        self.token_to_slot.clear()
+        self.cumulative_length = 0
+        self.free_slots = [(b, o) for b in range(self.num_blocks) for o in range(self.block_size)]
+        self.keys = torch.empty((1, self.num_heads, 0, self.head_dim), dtype=self.dtype, device=self.device)
+        self.values = torch.empty_like(self.keys)
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        return self.get_seq_length() + cache_position.shape[0], 0
+
+    def get_seq_length(self) -> int:
+        return self.cumulative_length
+
+    def get_max_cache_shape(self) -> int:
+        return self.num_blocks * self.block_size
+
+
+class PagedCache(Cache):
+    def __init__(
+        self,
+        block_size: int = 16,
+        num_blocks: int = 1000,
+        device: str = "cuda",
+    ):
+        super().__init__(
+            layer_class_to_replicate=lambda: PagedLayer(
+                block_size=block_size,
+                num_blocks=num_blocks,
+                device=device,
+            )
+        )
+        self.block_size = block_size
+        self.num_blocks = num_blocks
+        self.device = device
+
+    def memory_usage(self, dtype: torch.dtype = torch.float16) -> int:
+        bytes_per = torch.tensor([], dtype=dtype).element_size()
+        # K + V
+        return self.num_blocks * self.block_size * 2 * bytes_per
+
+
+class PrefixLayer(CacheLayerMixin):
+    """
+    Demo级 Prefix KV：prefix + suffix(dynamic)。
+    """
+    is_compileable = False
+    is_sliding = False
+
+    def __init__(self, max_prefix_length: int = 128):
+        super().__init__()
+        self.max_prefix_length = max_prefix_length
+        self.prefix_keys = None
+        self.prefix_values = None
+        self.suffix_keys = None
+        self.suffix_values = None
+
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        self.dtype, self.device = key_states.dtype, key_states.device
+        b, h, _, d = key_states.shape
+        self.keys = torch.empty((b, h, 0, d), dtype=self.dtype, device=self.device)
+        self.values = torch.empty_like(self.keys)
+        self.suffix_keys = self.keys
+        self.suffix_values = self.values
+        self.is_initialized = True
+
+    def _merge(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.prefix_keys is None:
+            return self.suffix_keys, self.suffix_values
+        if self.suffix_keys.shape[-2] == 0:
+            return self.prefix_keys, self.prefix_values
+        return (
+            torch.cat([self.prefix_keys, self.suffix_keys], dim=-2),
+            torch.cat([self.prefix_values, self.suffix_values], dim=-2),
+        )
+
+    def update(
+        self, key_states: torch.Tensor, value_states: torch.Tensor, cache_kwargs: dict[str, Any] | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+
+        is_prefix = bool(cache_kwargs.get("is_prefix", False)) if cache_kwargs is not None else False
+        if is_prefix:
+            p_len = min(key_states.shape[-2], self.max_prefix_length)
+            self.prefix_keys = key_states[:, :, :p_len, :].contiguous()
+            self.prefix_values = value_states[:, :, :p_len, :].contiguous()
+        else:
+            self.suffix_keys = torch.cat([self.suffix_keys, key_states], dim=-2)
+            self.suffix_values = torch.cat([self.suffix_values, value_states], dim=-2)
+
+        self.keys, self.values = self._merge()
+        return self.keys, self.values
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        return self.get_seq_length() + cache_position.shape[0], 0
+
+    def get_seq_length(self) -> int:
+        p = 0 if self.prefix_keys is None else self.prefix_keys.shape[-2]
+        s = 0 if self.suffix_keys is None else self.suffix_keys.shape[-2]
+        return p + s
+
+    def get_max_cache_shape(self) -> int:
+        return -1
+
+
+class PrefixCache(Cache):
+    def __init__(self, max_prefix_length: int = 128):
+        super().__init__(layer_class_to_replicate=lambda: PrefixLayer(max_prefix_length=max_prefix_length))
+        self.max_prefix_length = max_prefix_length
+        self._global_prefix = None  # (k, v)
+
+    def set_prefix(self, prefix_key_states: torch.Tensor, prefix_value_states: torch.Tensor):
+        self._global_prefix = (prefix_key_states, prefix_value_states)
+        for layer in self.layers:
+            layer.prefix_keys = prefix_key_states
+            layer.prefix_values = prefix_value_states
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # 确保层已创建
+        if self.layer_class_to_replicate is not None:
+            while len(self.layers) <= layer_idx:
+                self.layers.append(self.layer_class_to_replicate())
+
+        # 懒创建层时补上全局 prefix
+        if self._global_prefix is not None:
+            layer = self.layers[layer_idx]
+            if layer.prefix_keys is None:
+                layer.prefix_keys, layer.prefix_values = self._global_prefix
+
+        return super().update(key_states, value_states, layer_idx, cache_kwargs)
